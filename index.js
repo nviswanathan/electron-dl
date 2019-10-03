@@ -4,6 +4,15 @@ const {app, BrowserWindow, shell, dialog} = require('electron');
 const unusedFilename = require('unused-filename');
 const pupa = require('pupa');
 const extName = require('ext-name');
+let win = null;
+let pendingDownload = [];
+let waitingForDownloadItem = null;
+let downloadItems = new Set();
+let receivedBytes = 0;
+let completedBytes = 0;
+let totalBytes = 0;
+const activeDownloadItems = () => downloadItems.size;
+const progressDownloadItems = () => receivedBytes / totalBytes;
 
 function getFilenameFromMime(name, mime) {
 	const exts = extName.mime(mime);
@@ -15,13 +24,34 @@ function getFilenameFromMime(name, mime) {
 	return `${name}.${exts[0].ext}`;
 }
 
-function registerListener(session, options, cb = () => {}) {
-	const downloadItems = new Set();
-	let receivedBytes = 0;
-	let completedBytes = 0;
-	let totalBytes = 0;
-	const activeDownloadItems = () => downloadItems.size;
-	const progressDownloadItems = () => receivedBytes / totalBytes;
+function addNextDownload(){
+	if(waitingForDownloadItem == null){
+		console.log("Check for download next item")
+		let toDownload = pendingDownload.shift();
+		if(toDownload){
+			addDownload(toDownload);
+		}
+	}
+}
+
+function addSessionListner(e, item, webContents){
+	if(waitingForDownloadItem){
+		waitingForDownloadItem(e, item, webContents)
+	}
+}
+
+function registerListener(){
+	let session = win.webContents.session;
+	session.on('will-download',addSessionListner)		
+}
+
+function removeListener(){
+	if(win != null){
+		win.webContents.session.removeListener(addSessionListner);
+	}
+}
+
+function addDownload(options, cb = () => {}) {
 
 	options = Object.assign({
 		showBadge: true
@@ -29,6 +59,9 @@ function registerListener(session, options, cb = () => {}) {
 
 	const listener = (e, item, webContents) => {
 		downloadItems.add(item);
+		let itemTotalBytes = item.getTotalBytes();
+		let itemResivedBytes = item.getReceivedBytes();
+		const progressDownloadItem = () => itemResivedBytes / itemTotalBytes;
 		totalBytes += item.getTotalBytes();
 
 		let hostWebContents = webContents;
@@ -65,7 +98,7 @@ function registerListener(session, options, cb = () => {}) {
 				receivedBytes += item.getReceivedBytes();
 				return receivedBytes;
 			}, completedBytes);
-
+			itemResivedBytes  = item.getReceivedBytes();
 			if (options.showBadge && ['darwin', 'linux'].includes(process.platform)) {
 				app.setBadgeCount(activeDownloadItems());
 			}
@@ -75,7 +108,7 @@ function registerListener(session, options, cb = () => {}) {
 			}
 
 			if (typeof options.onProgress === 'function') {
-				options.onProgress(progressDownloadItems());
+				options.onProgress(progressDownloadItem());
 			}
 		});
 
@@ -94,9 +127,9 @@ function registerListener(session, options, cb = () => {}) {
 				totalBytes = 0;
 			}
 
-			if (options.unregisterWhenDone) {
-				session.removeListener('will-download', listener);
-			}
+			// if (options.unregisterWhenDone) {
+			// 	session.removeListener('will-download', listener);
+			// }
 
 			if (state === 'cancelled') {
 				if (typeof options.onCancel === 'function') {
@@ -104,8 +137,9 @@ function registerListener(session, options, cb = () => {}) {
 				}
 			} else if (state === 'interrupted') {
 				const message = pupa(errorMessage, {filename: item.getFilename()});
-				dialog.showErrorBox(errorTitle, message);
-				cb(new Error(message));
+				// commeted by viswanathan to avide notification window
+				// dialog.showErrorBox(errorTitle, message);
+				options.reject(new Error(message));
 			} else if (state === 'completed') {
 				if (process.platform === 'darwin') {
 					app.dock.downloadFinished(filePath);
@@ -115,12 +149,14 @@ function registerListener(session, options, cb = () => {}) {
 					shell.showItemInFolder(path.join(dir, item.getFilename()));
 				}
 
-				cb(null, item);
+				options.resolve(item);
 			}
 		});
+		waitingForDownloadItem = null;
+		addNextDownload();
 	};
-
-	session.on('will-download', listener);
+	waitingForDownloadItem = listener;
+	win.webContents.downloadURL(options.url);
 }
 
 module.exports = (options = {}) => {
@@ -132,16 +168,35 @@ module.exports = (options = {}) => {
 // TODO: Remove this for the next major release
 module.exports.default = module.exports;
 
-module.exports.download = (win, url, options) => new Promise((resolve, reject) => {
-	options = Object.assign({}, options, {unregisterWhenDone: true});
+module.exports.registerWinSession = (window) => {
+	if(win == null){
+		win = window;
+		registerListener()
+	} else {
+		// throw new Error("Windo already registered")
+	}
+}
 
-	registerListener(win.webContents.session, options, (err, item) => {
-		if (err) {
-			reject(err);
-		} else {
-			resolve(item);
-		}
-	});
+module.exports.removeSessionListener = () => {
+	removeListener();
+	win = null;
+}
 
-	win.webContents.downloadURL(url);
+module.exports.clearPendingDownloads = () => {
+	if(pendingDownload.length > 0){
+		pendingDownload.slice(0, pendingDownload.length);
+	}
+}
+
+module.exports.download = (url, options) => new Promise((resolve, reject) => {
+	if(win != null){
+		options = Object.assign({}, options);
+		options.resolve = resolve;
+		options.reject = reject;
+		options.url = url;
+		pendingDownload.push(options);
+		addNextDownload();
+	} else {
+		throw new Error("Window not registered")
+	}
 });
